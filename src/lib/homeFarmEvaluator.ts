@@ -10,6 +10,7 @@ import { EonetFetchResult, FarmProfile, PowerClimateResult } from '../types';
 import { computeDeterministicScore } from './scoring';
 import { LiveWeatherReading } from '../services/weather';
 import { createEmptyFarmProfile, loadFarmProfiles, upsertFarmProfile } from './farmStorage';
+import { formatSoilMoistureUnitLabel } from './soilProvenance';
 
 export interface HomeFieldView {
   id: string;
@@ -49,8 +50,10 @@ export interface HomeHealthBreakdown {
   trackSubtext: string;
   components: Array<{
     label: string;
-    score: number;
+    score: number | null;
     detail: string;
+    weightPct?: number;
+    assessable?: boolean;
   }>;
 }
 
@@ -125,6 +128,7 @@ export function ensureSyncedFarmProfiles(): FarmProfile[] {
       texture: 'Silt loam',
       moistureStatus: 'measured',
       moisturePct: 21,
+      moistureUnit: 'unspecified',
       moistureMethod: 'Soil moisture probe',
       moistureDate: new Date().toISOString().slice(0, 10),
       phStatus: 'tested',
@@ -196,6 +200,7 @@ export function ensureSyncedFarmProfiles(): FarmProfile[] {
       texture: 'Loam',
       moistureStatus: 'measured',
       moisturePct: 34,
+      moistureUnit: 'unspecified',
       moistureMethod: 'Tensiometer',
       moistureDate: new Date().toISOString().slice(0, 10),
       phStatus: 'tested',
@@ -269,18 +274,7 @@ function computeRealFieldHealth(
   const det = power || eonet ? computeDeterministicScore(power, eonet, 'farming') : null;
   let score = det ? det.dataScore : 84;
 
-  // Soil moisture suitability against crop water need
-  if (profile.soil.moistureStatus !== 'unknown' && profile.soil.moisturePct !== null) {
-    const m = profile.soil.moisturePct;
-    const highWater = item?.waterNeed === 'High';
-    const lowWater = item?.waterNeed === 'Low';
-    if (highWater && m < 26) score -= 14;
-    else if (lowWater && m > 52) score -= 10;
-    else if (m < 22) score -= 12;
-    else if (m >= 28 && m <= 48) score += 5;
-  }
-
-  // Soil pH suitability
+  // Soil pH suitability (only when lab/probe tested)
   if (profile.soil.phStatus === 'tested' && profile.soil.phValue !== null) {
     const ph = profile.soil.phValue;
     if (ph >= 6.0 && ph <= 7.3) score += 3;
@@ -310,11 +304,6 @@ function computeRealFieldHealth(
       profile.water.reliability === 'Highly unreliable')
   ) {
     score -= 9;
-  }
-
-  // Slight variance if multiple planned blocks have missing moisture measurements
-  if (!isCurrent && profile.soil.moistureStatus === 'unknown' && fieldIndex > 0) {
-    score -= 3;
   }
 
   const clamped = Math.round(Math.max(20, Math.min(98, score)));
@@ -413,32 +402,8 @@ export function evaluateRealFarmAlerts(
   eonet: EonetFetchResult | null
 ): HomeFarmAlert[] {
   const alerts: HomeFarmAlert[] = [];
-  const primaryFieldName = fields[0]?.name ?? 'Field 1';
 
-  // 1. Soil moisture alert (actual measured/estimated value below 25% or over-saturated > 70%)
-  if (profile.soil.moistureStatus !== 'unknown' && profile.soil.moisturePct !== null) {
-    if (profile.soil.moisturePct < 25) {
-      alerts.push({
-        id: 'soil-moisture-low',
-        severity: 'critical',
-        source: 'Soil Sensor',
-        message: `Soil moisture is low in ${primaryFieldName}.`,
-        recommendation: `Measured root-zone moisture is ${profile.soil.moisturePct}% (below optimal 28–45% band). Schedule targeted irrigation for ${primaryFieldName} (${fields[0]?.cropName ?? 'active crop'}).`,
-        metric: `Measured moisture: ${profile.soil.moisturePct}% · Target: 28–45%`,
-      });
-    } else if (profile.soil.moisturePct > 70) {
-      alerts.push({
-        id: 'soil-moisture-high',
-        severity: 'warning',
-        source: 'Soil Sensor',
-        message: `Excess soil saturation detected in ${primaryFieldName}.`,
-        recommendation: `Moisture reading is ${profile.soil.moisturePct}%. Pause irrigation and inspect drainage channels to prevent root hypoxia.`,
-        metric: `Measured moisture: ${profile.soil.moisturePct}% · Drainage: ${profile.soil.drainage || 'Check'}`,
-      });
-    }
-  }
-
-  // 2. Live Wind / Storm / Extreme Temperature alerts from Open-Meteo
+  // 1. Live Wind / Storm / Extreme Temperature alerts from Open-Meteo
   if (weather) {
     if (weather.windKmh >= 26) {
       alerts.push({
@@ -545,11 +510,11 @@ export function evaluateRealFarmAlerts(
 }
 
 /**
- * Computes overall farm health (0–100%) strictly from real sub-calculations:
- * 1) NASA POWER + EONET deterministic suitability score (40% weight)
- * 2) Soil health & moisture balance (25% weight)
- * 3) Live weather comfort & stress index (20% weight)
- * 4) Water reliability & crop rotation diversity (15% weight)
+ * Computes overall farm health (0–100%) strictly from assessable sub-calculations:
+ * 1) NASA POWER + EONET deterministic suitability score (40% nominal weight)
+ * 2) Tested soil pH assessment (25% nominal weight when tested; omitted from average if unassessed)
+ * 3) Live weather comfort & stress index (20% nominal weight)
+ * 4) Water reliability & crop rotation diversity (15% nominal weight)
  */
 export function computeRealFarmHealth(
   profile: FarmProfile,
@@ -569,36 +534,29 @@ export function computeRealFarmHealth(
     climateDetail = `NASA POWER (${power?.yearsAnalyzed.length ?? 0}yr) · ${hazardCount} EONET hazards`;
   }
 
-  // Component 2: Soil Condition & Moisture Balance (25%)
-  let soilScore = 76;
+  // Component 2: Soil Assessment (25% when lab/probe pH is tested; unassessed otherwise — no fake neutral score or universal moisture bands)
+  let soilScore: number | null = null;
   const soilNotes: string[] = [];
-  if (profile.soil.moistureStatus !== 'unknown' && profile.soil.moisturePct !== null) {
-    const m = profile.soil.moisturePct;
-    if (m >= 28 && m <= 45) {
-      soilScore = 95;
-      soilNotes.push(`Optimal moisture (${m}%)`);
-    } else if (m >= 20 && m < 28) {
-      soilScore = 76;
-      soilNotes.push(`Slightly dry (${m}%)`);
-    } else if (m > 45 && m <= 60) {
-      soilScore = 80;
-      soilNotes.push(`Moist (${m}%)`);
-    } else {
-      soilScore = 55;
-      soilNotes.push(`Moisture stress (${m}%)`);
-    }
-  } else {
-    soilNotes.push('Moisture unmeasured');
-  }
   if (profile.soil.phStatus === 'tested' && profile.soil.phValue !== null) {
     const ph = profile.soil.phValue;
     if (ph >= 6.0 && ph <= 7.3) {
-      soilScore = Math.min(100, soilScore + 5);
-      soilNotes.push(`pH ${ph}`);
-    } else if (ph < 5.5 || ph > 8.0) {
-      soilScore = Math.max(40, soilScore - 15);
-      soilNotes.push(`pH ${ph} out of range`);
+      soilScore = 90;
+    } else if (ph >= 5.5 && ph <= 8.0) {
+      soilScore = 72;
+    } else {
+      soilScore = 50;
     }
+    soilNotes.push(`Tested pH ${ph}`);
+  } else {
+    soilNotes.push('Soil pH not tested — soil condition unassessed');
+  }
+
+  if (profile.soil.moistureStatus !== 'unknown' && profile.soil.moisturePct !== null) {
+    const unitLabel = formatSoilMoistureUnitLabel(profile.soil.moistureUnit);
+    const methodSuffix = profile.soil.moistureMethod ? `, ${profile.soil.moistureMethod}` : '';
+    soilNotes.push(`Recorded moisture: ${profile.soil.moisturePct}% (${unitLabel}${methodSuffix}; unscored)`);
+  } else {
+    soilNotes.push('Moisture unmeasured');
   }
 
   // Component 3: Live Weather Stress Index (20%)
@@ -629,13 +587,19 @@ export function computeRealFarmHealth(
   }
   rotationScore = Math.max(30, Math.min(100, rotationScore));
 
-  // Weighted total minus small penalty per active critical alert
+  // Weighted total over assessable components only (no synthetic neutral score injected)
   const criticalCount = alerts.filter((a) => a.severity === 'critical').length;
+  const weightedParts: Array<{ score: number; weight: number }> = [
+    { score: climateScore, weight: 0.4 },
+    { score: weatherScore, weight: 0.2 },
+    { score: rotationScore, weight: 0.15 },
+  ];
+  if (soilScore !== null) {
+    weightedParts.push({ score: soilScore, weight: 0.25 });
+  }
+  const activeWeightSum = weightedParts.reduce((sum, p) => sum + p.weight, 0);
   const rawTotal =
-    climateScore * 0.4 +
-    soilScore * 0.25 +
-    weatherScore * 0.2 +
-    rotationScore * 0.15 -
+    weightedParts.reduce((sum, p) => sum + p.score * p.weight, 0) / activeWeightSum -
     criticalCount * 2;
   const overallPct = Math.round(Math.max(15, Math.min(99, rawTotal)));
 
@@ -648,14 +612,14 @@ export function computeRealFarmHealth(
     trackHeadline = 'Your farm is on track!';
     trackSubtext =
       alerts.length === 0
-        ? 'Everything looks healthy across all monitored fields.'
+        ? 'Climate, weather, and active monitored indicators look strong.'
         : `Overall resilience is strong (${alerts.length} active advisory).`;
   } else if (overallPct >= 70) {
     statusLabel = 'Healthy';
     trackHeadline = 'Your farm is performing steadily.';
     trackSubtext =
       alerts.length === 0
-        ? 'All core climate and soil indicators remain balanced.'
+        ? 'Assessed climate, weather, and rotation indicators remain balanced.'
         : `Review ${alerts.length} active field advisory to maintain peak yield.`;
   } else if (overallPct >= 50) {
     statusLabel = 'Moderate';
@@ -664,7 +628,11 @@ export function computeRealFarmHealth(
   } else {
     statusLabel = 'Needs Attention';
     trackHeadline = 'Action recommended on active fields.';
-    trackSubtext = 'Multiple environmental or soil stress factors detected.';
+    trackSubtext = 'Multiple environmental or crop stress factors detected.';
+  }
+
+  if (soilScore === null) {
+    trackSubtext = `${trackSubtext} Soil condition is unassessed until a soil pH test is entered.`;
   }
 
   return {
@@ -673,13 +641,33 @@ export function computeRealFarmHealth(
     trackHeadline,
     trackSubtext,
     components: [
-      { label: 'NASA Climate & Hazards', score: Math.round(climateScore), detail: climateDetail },
-      { label: 'Soil & Moisture Balance', score: Math.round(soilScore), detail: soilNotes.join(' · ') },
-      { label: 'Live Weather Index', score: Math.round(weatherScore), detail: weatherDetail },
+      {
+        label: 'NASA Climate & Hazards',
+        score: Math.round(climateScore),
+        detail: climateDetail,
+        weightPct: 40,
+        assessable: true,
+      },
+      {
+        label: soilScore !== null ? 'Soil Condition (Tested pH)' : 'Soil Condition (Unassessed)',
+        score: soilScore !== null ? Math.round(soilScore) : null,
+        detail: soilNotes.join(' · '),
+        weightPct: soilScore !== null ? 25 : 0,
+        assessable: soilScore !== null,
+      },
+      {
+        label: 'Live Weather Index',
+        score: Math.round(weatherScore),
+        detail: weatherDetail,
+        weightPct: 20,
+        assessable: true,
+      },
       {
         label: 'Rotation & Water',
         score: Math.round(rotationScore),
         detail: `${fields.length} fields · ${roles.has('fixer') ? 'Legume N-fixer included' : 'Rotation active'}`,
+        weightPct: 15,
+        assessable: true,
       },
     ],
   };

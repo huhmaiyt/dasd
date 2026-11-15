@@ -203,11 +203,6 @@ export function buildAssessedFarmRecord(
   let worstFieldName: string | null = null;
   let worstFieldReason: string | null = null;
 
-  if (raw.soil.moistureStatus !== 'unknown' && raw.soil.moisturePct !== null && raw.soil.moisturePct < 19) {
-    criticalAlertsCount++;
-    activeAlertsCount++;
-    worstFieldReason = `Low topsoil moisture (${raw.soil.moisturePct}% VWC)`;
-  }
   if (
     raw.water.dailyCapacityKnown &&
     raw.water.dailyCapacityM3 !== null &&
@@ -258,20 +253,16 @@ export function buildAssessedFarmRecord(
     freshnessState = 'fresh';
   }
 
-  const confidencePct = hasAnyAssessment
-    ? Math.max(25, Math.min(96, Math.round(completenessPct * 0.85 + (observations.some((o) => o.farmId === raw.id) ? 10 : 0) - (staleReasons.length > 0 ? 14 : 0))))
-    : Math.round(completenessPct * 0.4);
-
   const summary =
     raw.mapExplanation ||
     (status === 'good'
-      ? `Soil, moisture, and climate signals support ${raw.primaryCrop || 'current crop rotation'}.`
+      ? `Soil, water, and climate signals support ${raw.primaryCrop || 'current crop rotation'}.`
       : status === 'alert'
-        ? worstFieldReason || 'Critical moisture or irrigation capacity constraint requires attention.'
+        ? worstFieldReason || 'Critical irrigation capacity or field review alert requires attention.'
         : status === 'needs_refresh'
           ? staleReasons[0] || 'Assessment exceeds freshness window; re-run recommended.'
           : status === 'needs_attention'
-            ? worstFieldReason || 'Moderate moisture or supply variability detected.'
+            ? worstFieldReason || 'Field review or water supply variability detected.'
             : missingLabels.length > 0
               ? `Missing ${missingLabels.slice(0, 3).join(', ').toLowerCase()} before full scoring.`
               : 'Ready to run climate and soil assessment.');
@@ -280,7 +271,6 @@ export function buildAssessedFarmRecord(
     status,
     freshnessState,
     score,
-    confidencePct,
     completenessPct,
     assessedAt: raw.lastAssessedAt,
     activeAlertsCount,
@@ -478,18 +468,15 @@ export function generateRotationCandidatesForFarm(farm: MyFarmRecord): RotationC
   const isWaterLimited =
     farm.water.reliability === 'Frequently limited' ||
     farm.water.reliability === 'Highly unreliable' ||
-    farm.water.reliability === 'Sometimes limited' ||
-    (farm.soil.moisturePct !== null && farm.soil.moisturePct < 24);
+    farm.water.reliability === 'Sometimes limited';
   const currentCrop = (farm.primaryCrop || 'Wheat').trim();
   const baseScore = farm.assessment.score ?? 68;
-  const conf = farm.assessment.confidencePct || 52;
 
   const candidates: RotationCandidateOption[] = [
     {
       id: 'rot-wheat-peas-cover',
       title: 'Wheat → Peas → Cover Oats',
       suitabilityScore: Math.min(95, Math.max(54, isWaterLimited ? baseScore + 6 : baseScore + 4)),
-      confidencePct: conf,
       primaryBenefit: 'Nitrogen fixation + low peak summer drawdown',
       waterDemandImpact: 'Reduces demand',
       waterDemandMmEstimate: 310,
@@ -525,7 +512,6 @@ export function generateRotationCandidatesForFarm(farm: MyFarmRecord): RotationC
       id: 'rot-sunflower-lentils-wheat',
       title: 'Sunflower → Lentils → Winter Wheat (Low Water)',
       suitabilityScore: Math.min(93, Math.max(50, isWaterLimited ? baseScore + 12 : baseScore - 2)),
-      confidencePct: conf,
       primaryBenefit: 'Deep taproot scavenging during dry seasons',
       waterDemandImpact: 'Reduces demand',
       waterDemandMmEstimate: 275,
@@ -564,7 +550,6 @@ export function generateRotationCandidatesForFarm(farm: MyFarmRecord): RotationC
       id: 'rot-maize-soy-sunflower',
       title: 'Maize → Soybean → Sunflower',
       suitabilityScore: Math.min(90, Math.max(38, isWaterLimited ? baseScore - 8 : baseScore + 2)),
-      confidencePct: conf,
       primaryBenefit: 'High biomass & grain revenue balance',
       waterDemandImpact: 'Increases demand',
       waterDemandMmEstimate: 445,
@@ -667,6 +652,8 @@ export function syncFarmToLocalProfiles(farm: MyFarmRecord): void {
       texture: (farm.soil.texture as FarmProfile['soil']['texture']) || base.soil.texture,
       moistureStatus: farm.soil.moistureStatus,
       moisturePct: farm.soil.moisturePct,
+      moistureUnit: farm.soil.moistureUnit ?? 'unspecified',
+      moistureDepth: farm.soil.moistureDepth ?? '',
       moistureMethod: farm.soil.moistureMethod,
       moistureDate: farm.soil.moistureDate,
       phStatus: farm.soil.phStatus,

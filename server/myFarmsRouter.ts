@@ -331,6 +331,8 @@ interface FarmMetaExtension {
     texture: string;
     moistureStatus: 'measured' | 'estimated' | 'unknown';
     moisturePct: number | null;
+    moistureUnit?: 'volumetric_vwc' | 'gravimetric' | 'available_water_pct' | 'unspecified';
+    moistureDepth?: string;
     moistureMethod: string;
     moistureDate: string;
     phStatus: 'tested' | 'not_tested';
@@ -391,6 +393,81 @@ interface PortfolioStore {
   irrigationLogs: Array<Record<string, unknown>>;
   snapshots: Array<Record<string, unknown>>;
   appliedOpIds: string[];
+}
+
+type RouterMoistureUnit = 'volumetric_vwc' | 'gravimetric' | 'available_water_pct' | 'unspecified';
+
+const VALID_ROUTER_MOISTURE_UNITS: ReadonlySet<RouterMoistureUnit> = new Set([
+  'volumetric_vwc',
+  'gravimetric',
+  'available_water_pct',
+  'unspecified',
+]);
+
+function normalizeRouterMoistureUnit(value: unknown): RouterMoistureUnit {
+  if (typeof value === 'string' && VALID_ROUTER_MOISTURE_UNITS.has(value as RouterMoistureUnit)) {
+    return value as RouterMoistureUnit;
+  }
+  return 'unspecified';
+}
+
+function normalizeRouterSoil(soil: Partial<FarmMetaExtension['soil']> | undefined): FarmMetaExtension['soil'] {
+  const s = soil ?? {};
+  return {
+    texture: typeof s.texture === 'string' && s.texture ? s.texture : 'Unknown',
+    moistureStatus:
+      s.moistureStatus === 'measured' || s.moistureStatus === 'estimated' || s.moistureStatus === 'unknown'
+        ? s.moistureStatus
+        : 'unknown',
+    moisturePct: typeof s.moisturePct === 'number' && Number.isFinite(s.moisturePct) ? s.moisturePct : null,
+    moistureUnit: normalizeRouterMoistureUnit(s.moistureUnit),
+    moistureDepth: typeof s.moistureDepth === 'string' ? s.moistureDepth : '',
+    moistureMethod: typeof s.moistureMethod === 'string' ? s.moistureMethod : '',
+    moistureDate: typeof s.moistureDate === 'string' ? s.moistureDate : '',
+    phStatus: s.phStatus === 'tested' || s.phStatus === 'not_tested' ? s.phStatus : 'not_tested',
+    phValue: typeof s.phValue === 'number' && Number.isFinite(s.phValue) ? s.phValue : null,
+    phTestDate: typeof s.phTestDate === 'string' ? s.phTestDate : '',
+    organicMatterPct:
+      typeof s.organicMatterPct === 'number' && Number.isFinite(s.organicMatterPct) ? s.organicMatterPct : null,
+    drainage: typeof s.drainage === 'string' && s.drainage ? s.drainage : 'Unknown',
+    slopePct: typeof s.slopePct === 'number' && Number.isFinite(s.slopePct) ? s.slopePct : null,
+    elevationM: typeof s.elevationM === 'number' && Number.isFinite(s.elevationM) ? s.elevationM : null,
+    preparationMethods: Array.isArray(s.preparationMethods) ? (s.preparationMethods as string[]) : [],
+    notes: typeof s.notes === 'string' ? s.notes : '',
+  };
+}
+
+function sanitizeFieldSoilOverrides(
+  raw: Record<string, unknown> | null | undefined
+): Record<string, unknown> | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const out: Record<string, unknown> = {};
+  if (typeof raw.texture === 'string' && raw.texture) out.texture = raw.texture;
+  if (typeof raw.drainage === 'string' && raw.drainage) out.drainage = raw.drainage;
+  if (
+    raw.moistureStatus === 'measured' ||
+    raw.moistureStatus === 'estimated' ||
+    raw.moistureStatus === 'unknown'
+  ) {
+    out.moistureStatus = raw.moistureStatus;
+  }
+  if (raw.moisturePct === null || (typeof raw.moisturePct === 'number' && Number.isFinite(raw.moisturePct))) {
+    out.moisturePct = raw.moisturePct;
+  }
+  if (raw.moistureUnit !== undefined) {
+    out.moistureUnit = normalizeRouterMoistureUnit(raw.moistureUnit);
+  }
+  if (typeof raw.moistureDepth === 'string') out.moistureDepth = raw.moistureDepth;
+  if (typeof raw.moistureMethod === 'string') out.moistureMethod = raw.moistureMethod;
+  if (typeof raw.moistureDate === 'string') out.moistureDate = raw.moistureDate;
+  if (raw.phStatus === 'tested' || raw.phStatus === 'not_tested') {
+    out.phStatus = raw.phStatus;
+  }
+  if (raw.phValue === null || (typeof raw.phValue === 'number' && Number.isFinite(raw.phValue))) {
+    out.phValue = raw.phValue;
+  }
+  if (typeof raw.phTestDate === 'string') out.phTestDate = raw.phTestDate;
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 function writeJsonAtomic(filePath: string, data: unknown): void {
@@ -1093,6 +1170,8 @@ function defaultMetaForMapFarm(farm: StoredMapFarm): FarmMetaExtension {
       texture: 'Unknown',
       moistureStatus: 'unknown',
       moisturePct: null,
+      moistureUnit: 'unspecified',
+      moistureDepth: '',
       moistureMethod: '',
       moistureDate: '',
       phStatus: 'not_tested',
@@ -1211,7 +1290,7 @@ function buildUnifiedPortfolioPayload() {
       activePlan: meta.activePlan ?? null,
       recommendedPlanId: meta.recommendedPlanId ?? null,
       recommendedPlanTitle: meta.recommendedPlanTitle ?? null,
-      soil: meta.soil,
+      soil: normalizeRouterSoil(meta.soil),
       water: meta.water,
       planningHorizon: meta.planningHorizon || '',
       priorities: meta.priorities || [],
@@ -1230,7 +1309,7 @@ function buildUnifiedPortfolioPayload() {
     return {
       ...f,
       previousCrops: fm?.previousCrops ?? [],
-      soilOverrides: fm?.soilOverrides ?? undefined,
+      soilOverrides: sanitizeFieldSoilOverrides(fm?.soilOverrides),
       waterOverrides: fm?.waterOverrides ?? undefined,
       activePlanId: fm?.activePlanId ?? null,
       activePlanTitle: fm?.activePlanTitle ?? null,
@@ -1421,22 +1500,7 @@ export function createMyFarmsRouter(): express.Router {
       activePlan: null,
       recommendedPlanId: null,
       recommendedPlanTitle: null,
-      soil: {
-        texture: typeof sIn.texture === 'string' && sIn.texture ? sIn.texture : 'Unknown',
-        moistureStatus: sIn.moistureStatus ?? 'unknown',
-        moisturePct: typeof sIn.moisturePct === 'number' ? sIn.moisturePct : null,
-        moistureMethod: sIn.moistureMethod ?? '',
-        moistureDate: sIn.moistureDate ?? '',
-        phStatus: sIn.phStatus ?? 'not_tested',
-        phValue: typeof sIn.phValue === 'number' ? sIn.phValue : null,
-        phTestDate: sIn.phTestDate ?? '',
-        organicMatterPct: typeof sIn.organicMatterPct === 'number' ? sIn.organicMatterPct : null,
-        drainage: typeof sIn.drainage === 'string' && sIn.drainage ? sIn.drainage : 'Unknown',
-        slopePct: typeof sIn.slopePct === 'number' ? sIn.slopePct : null,
-        elevationM: typeof sIn.elevationM === 'number' ? sIn.elevationM : null,
-        preparationMethods: Array.isArray(sIn.preparationMethods) ? (sIn.preparationMethods as string[]) : [],
-        notes: typeof sIn.notes === 'string' ? sIn.notes : '',
-      },
+      soil: normalizeRouterSoil(sIn),
       water: {
         sources: Array.isArray(wIn.sources) && wIn.sources.length > 0 ? (wIn.sources as string[]) : ['Unknown'],
         reliability: typeof wIn.reliability === 'string' && wIn.reliability ? wIn.reliability : 'Unknown',
@@ -1585,7 +1649,9 @@ export function createMyFarmsRouter(): express.Router {
       archivedAt: d.archived === undefined ? existingMeta.archivedAt : d.archived ? now : null,
       isDraft: d.isDraft !== undefined ? d.isDraft : existingMeta.isDraft,
       notes: d.notes !== undefined ? d.notes : existingMeta.notes,
-      soil: d.soil ? { ...existingMeta.soil, ...d.soil } : existingMeta.soil,
+      soil: d.soil
+        ? normalizeRouterSoil({ ...existingMeta.soil, ...(d.soil as Partial<FarmMetaExtension['soil']>) })
+        : normalizeRouterSoil(existingMeta.soil),
       water: d.water ? { ...existingMeta.water, ...d.water } : existingMeta.water,
       planningHorizon: d.planningHorizon ?? existingMeta.planningHorizon,
       priorities: d.priorities ?? existingMeta.priorities,
@@ -1950,7 +2016,7 @@ export function createMyFarmsRouter(): express.Router {
       soilSummary: z.string().optional(),
       waterSummary: z.string().optional(),
       previousCrops: z.array(z.string()).optional(),
-      soilOverrides: z.record(z.string(), z.unknown()).optional(),
+      soilOverrides: z.record(z.string(), z.unknown()).nullable().optional(),
       waterOverrides: z.record(z.string(), z.unknown()).optional(),
       rotationReviewDue: z.boolean().optional(),
       notes: z.string().optional(),
@@ -1993,7 +2059,10 @@ export function createMyFarmsRouter(): express.Router {
     port.fieldMeta[req.params.fieldId] = {
       ...existingFm,
       previousCrops: d.previousCrops ?? existingFm.previousCrops,
-      soilOverrides: d.soilOverrides ?? existingFm.soilOverrides,
+      soilOverrides:
+        d.soilOverrides === undefined
+          ? existingFm.soilOverrides
+          : sanitizeFieldSoilOverrides(d.soilOverrides),
       waterOverrides: d.waterOverrides ?? existingFm.waterOverrides,
       rotationReviewDue: d.rotationReviewDue ?? existingFm.rotationReviewDue,
       notes: d.notes ?? existingFm.notes,

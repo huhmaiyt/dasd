@@ -6,9 +6,10 @@ import {
   PlanDecisionEvent,
   PortfolioFieldRecord,
 } from '../types/myFarms';
-import { SoilTexture } from '../types/farm';
+import { SoilMoistureUnit, SoilTexture } from '../types/farm';
 import { EonetFetchResult, PowerClimateResult } from '../types';
 import { ExtendedFieldWeatherResult, LiveWeatherReading } from '../services/weather';
+import { formatSoilMoistureUnitLabel, resolveEffectiveFieldSoil } from './soilProvenance';
 
 export const AGRONOMY_ENGINE_VERSION = 'fieldshift-fao56-v1.3.0';
 export const CROP_KNOWLEDGE_VERSION = 'fao56-crop-lib-v1.2.0';
@@ -51,7 +52,7 @@ export interface InspectableMetric {
   inputs: MetricInputRecord[];
   intermediateSteps: string[];
   confidenceLevel: ConfidenceLevel;
-  confidencePct: number;
+  confidencePct?: number;
   limitations: string;
   relatedContext: string;
 }
@@ -442,9 +443,9 @@ export interface SoilPedotransferProfile {
   siltPct: number | null;
   clayPct: number | null;
   usdaClass: string;
-  fcVwcPct: number;
-  wpVwcPct: number;
-  awcMmPerM: number;
+  fcVwcPct: number | null;
+  wpVwcPct: number | null;
+  awcMmPerM: number | null;
   fcWpSource: FactTypeLabel;
   phValue: number | null;
   phStatusLabel: string;
@@ -594,15 +595,22 @@ export interface FieldAgronomyBundle {
     }>;
   };
   water: {
-    tawMm: number;
-    rawMm: number;
-    currentDrMm: number;
-    depletionPctOfTaw: number;
-    estimatedMoistureVwcPct: number;
+    tawMm: number | null;
+    rawMm: number | null;
+    currentDrMm: number | null;
+    depletionPctOfTaw: number | null;
+    estimatedMoistureVwcPct: number | null;
+    observedMoisturePct: number | null;
+    observedMoistureUnit: SoilMoistureUnit;
+    observedMoistureDepth: string;
+    observedMoistureMethod: string;
+    observedMoistureDate: string;
+    moistureUnitAmbiguityNote: string | null;
+    hydraulicAvailabilityReason: string | null;
     moistureSourceLabel: string;
-    currentKs: number;
-    etcPotentialMmDay: number;
-    etcAdjMmDay: number;
+    currentKs: number | null;
+    etcPotentialMmDay: number | null;
+    etcAdjMmDay: number | null;
     observedRain30dMm: number;
     effectiveRain30dMm: number;
     confirmedIrrigation30dMm: number;
@@ -611,11 +619,11 @@ export interface FieldAgronomyBundle {
     forecastEtc7dMm: number;
     triggerActive: boolean;
     daysUntilRawCrossed: number | null;
-    netRefillMm: number;
+    netRefillMm: number | null;
     assumedEa: number;
     eaSourceLabel: string;
-    grossDepthMm: number;
-    recommendedVolumeM3: number;
+    grossDepthMm: number | null;
+    recommendedVolumeM3: number | null;
     flowRateKnown: boolean;
     infiltrationKnown: boolean;
     runtimeNote: string;
@@ -710,49 +718,46 @@ export function buildFieldAgronomyBundle(params: {
       ? `Field area (${areaHa.toFixed(1)} ha) is smaller than NASA POWER (0.5° ≈ 55 km) & Open-Meteo (~9–25 km) grid cells; weather variables represent gridded regional context sampled at centroid.`
       : `Field (${areaHa.toFixed(1)} ha) sampled at farm/field centroid across Open-Meteo & NASA POWER gridded cells.`;
 
-  // Soil Profile & Pedotransfer
-  const texture = field?.soilOverrides?.texture || farm.soil.texture || 'Loam';
-  const texKey = SOIL_PEDOTRANSFER[texture] ? texture : 'Loam';
-  const pedo = SOIL_PEDOTRANSFER[texKey];
-  const hasExplicitTexture = texture !== 'Unknown';
-  const phVal =
-    field?.soilOverrides?.phValue !== undefined && field.soilOverrides.phValue !== null
-      ? field.soilOverrides.phValue
-      : farm.soil.phStatus === 'tested'
-        ? farm.soil.phValue
-        : null;
-  const phStatus = field?.soilOverrides?.phStatus || farm.soil.phStatus;
-  const omPct = farm.soil.organicMatterPct;
+  // Soil Profile & Pedotransfer (never fabricate Loam priors when soil texture is Unknown)
+  const effSoil = resolveEffectiveFieldSoil(farm.soil, field?.soilOverrides);
+  const texture = effSoil.texture;
+  const pedo = texture !== 'Unknown' && SOIL_PEDOTRANSFER[texture] ? SOIL_PEDOTRANSFER[texture] : null;
+  const hasExplicitTexture = pedo !== null;
+  const phVal = effSoil.phValue;
+  const phStatus = effSoil.phStatus;
+  const omPct = effSoil.organicMatterPct;
   const ocPct = omPct !== null ? Number((omPct / 1.724).toFixed(2)) : null;
 
   const soilProfile: SoilPedotransferProfile = {
-    texture: hasExplicitTexture ? texture : 'Unknown (Pedotransfer Loam prior)',
-    textureSource: hasExplicitTexture ? 'Farmer-reported' : 'Mapped estimate',
-    sandPct: hasExplicitTexture ? pedo.sand : null,
-    siltPct: hasExplicitTexture ? pedo.silt : null,
-    clayPct: hasExplicitTexture ? pedo.clay : null,
-    usdaClass: hasExplicitTexture ? texKey : 'Unconfirmed',
-    fcVwcPct: pedo.fc,
-    wpVwcPct: pedo.wp,
-    awcMmPerM: Math.round((pedo.fc - pedo.wp) * 10),
-    fcWpSource: 'Mapped estimate',
+    texture: hasExplicitTexture ? texture : 'Unknown',
+    textureSource: hasExplicitTexture ? 'Farmer-reported' : 'Unavailable',
+    sandPct: pedo ? pedo.sand : null,
+    siltPct: pedo ? pedo.silt : null,
+    clayPct: pedo ? pedo.clay : null,
+    usdaClass: hasExplicitTexture ? texture : 'Unavailable',
+    fcVwcPct: pedo ? pedo.fc : null,
+    wpVwcPct: pedo ? pedo.wp : null,
+    awcMmPerM: pedo ? Math.round((pedo.fc - pedo.wp) * 10) : null,
+    fcWpSource: pedo ? 'Mapped estimate' : 'Unavailable',
     phValue: phVal,
     phStatusLabel:
       phVal !== null
         ? `${phVal.toFixed(1)} (${phStatus === 'tested' ? 'Lab tested' : 'Reported'})`
-        : 'Not tested',
+        : effSoil.phSource === 'field_suppressed'
+          ? 'Not tested (field override)'
+          : 'Not tested',
     phSource: phVal !== null ? (phStatus === 'tested' ? 'Lab-measured' : 'Farmer-reported') : 'Unavailable',
     organicMatterPct: omPct,
     organicCarbonPct: ocPct,
     organicSource: omPct !== null ? 'Farmer-reported' : 'Unavailable',
-    bulkDensityGCm3: hasExplicitTexture ? pedo.bd : null,
+    bulkDensityGCm3: pedo ? pedo.bd : null,
     cecCmolKg: null,
     ecDsM: farm.water.ecDsM ?? null,
     labNMgKg: null,
     labPMgKg: null,
     labKMgKg: null,
     hasFullLabNpk: false,
-    drainage: field?.soilOverrides?.drainage || farm.soil.drainage || 'Moderately',
+    drainage: effSoil.drainage,
     elevationM: farm.soil.elevationM ?? extendedWeather?.elevationM ?? null,
     slopePct: farm.soil.slopePct ?? null,
   };
@@ -977,12 +982,11 @@ export function buildFieldAgronomyBundle(params: {
     curWindKmh !== null ? Number(((curWindKmh / 3.6) * 0.748).toFixed(2)) : null;
 
   // Compute daily FAO-56 Root-Zone Water Balance (Section 12)
-  const tawMm = Math.round(1000 * ((pedo.fc - pedo.wp) / 100) * currentZrM);
-  const avgEtcGuess = (et0TodayMm ?? 4.2) * currentKc;
+  // Guard: soil-water hydraulic capacities (TAW, RAW, Dr) require a known soil texture.
+  const avgEtcForP = (et0TodayMm ?? 4.2) * currentKc;
   const pAdjusted = Number(
-    Math.max(0.1, Math.min(0.8, crop.pBase + 0.04 * (5 - avgEtcGuess))).toFixed(2)
+    Math.max(0.1, Math.min(0.8, crop.pBase + 0.04 * (5 - avgEtcForP))).toFixed(2)
   );
-  const rawMm = Math.round(pAdjusted * tawMm);
 
   // Map confirmed irrigation logs for this field or farm-wide fallback
   const fieldIrrLogs = irrigationLogs.filter(
@@ -997,152 +1001,33 @@ export function buildFieldAgronomyBundle(params: {
     irrByDate.set(log.date, (irrByDate.get(log.date) ?? 0) + depthMm);
   }
 
-  // Initialize Dr from measured moisture if available, else neutral 35% of TAW prior
-  const measuredMoisturePct =
-    field?.soilOverrides?.moistureStatus && field.soilOverrides.moistureStatus !== 'unknown'
-      ? field.soilOverrides.moisturePct ?? null
-      : farm.soil.moistureStatus !== 'unknown'
-        ? farm.soil.moisturePct
-        : null;
+  // Only explicitly confirmed volumetric_vwc (non-tensiometer) readings may enter VWC depletion math.
+  // Raw readings and metadata remain preserved in observedMoisture* fields regardless of unit.
+  const vwcCompatibleMoisturePct =
+    effSoil.isVwcCompatibleForBalance && effSoil.moisturePct !== null ? effSoil.moisturePct : null;
 
+  const observedUnitLabel = formatSoilMoistureUnitLabel(effSoil.moistureUnit);
   const moistureSourceLabel =
-    field?.soilOverrides?.moistureStatus === 'measured' || farm.soil.moistureStatus === 'measured'
-      ? 'Farmer / Probe Measured'
-      : farm.soil.moistureStatus === 'estimated'
-        ? 'Farmer-Estimated Baseline'
-        : 'Modelled FAO-56 Root-Zone Balance';
+    effSoil.moistureStatus === 'unknown' || effSoil.moisturePct === null
+      ? pedo
+        ? 'Modelled FAO-56 Root-Zone Balance'
+        : 'Unavailable'
+      : effSoil.moistureStatus === 'measured'
+        ? effSoil.isVwcCompatibleForBalance
+          ? effSoil.moistureProvenanceLabel === 'Field measured'
+            ? 'Field Probe Measured (% VWC)'
+            : 'Farmer / Probe Measured (% VWC)'
+          : `${effSoil.moistureProvenanceLabel} (${observedUnitLabel} — excluded from VWC balance)`
+        : effSoil.isVwcCompatibleForBalance
+          ? `${effSoil.moistureProvenanceLabel} (% VWC)`
+          : `${effSoil.moistureProvenanceLabel} (${observedUnitLabel} — excluded from VWC balance)`;
 
-  let drPrev =
-    measuredMoisturePct !== null
-      ? Math.max(0, Math.min(tawMm, Math.round(((pedo.fc - measuredMoisturePct) / 100) * 1000 * currentZrM)))
-      : Math.round(tawMm * 0.34);
+  const hydraulicAvailabilityReason: string | null = !pedo
+    ? effSoil.moistureUnitAmbiguityNote
+      ? `Soil texture is Unknown — field capacity, wilting point, TAW, RAW, and root-zone depletion balance are unavailable until soil texture is confirmed. ${effSoil.moistureUnitAmbiguityNote}`
+      : 'Soil texture is Unknown — field capacity, wilting point, TAW, RAW, and root-zone depletion balance are unavailable until soil texture is confirmed.'
+    : effSoil.moistureUnitAmbiguityNote;
 
-  const dailyBalanceSeries: DailyWaterBalancePoint[] = [];
-  let effectiveRain30dMm = 0;
-  let confirmedIrrigation30dMm = 0;
-
-  // Observed / Reanalysis historical water balance
-  const balanceWindow = pastSeries.slice(-21);
-  for (const day of balanceWindow) {
-    const et0 = day.et0Mm ?? 4.0;
-    const drStart = drPrev;
-    const ks = drStart <= rawMm ? 1 : Math.max(0, Math.min(1, (tawMm - drStart) / Math.max(1, tawMm - rawMm)));
-    const pRain = day.precipMm ?? 0;
-    const irrNet = Number((irrByDate.get(day.date) ?? 0).toFixed(2));
-    confirmedIrrigation30dMm += irrNet;
-
-    // Simple runoff threshold when daily rain > 22 mm on low drainage/high slope
-    const slopeFactor = (soilProfile.slopePct ?? 2) > 5 ? 0.18 : 0.08;
-    const runoff = pRain > 22 ? Number(((pRain - 22) * slopeFactor).toFixed(2)) : 0;
-
-    // Surface evaporation Ke pulses gently after wetting events, capped by Kc_max
-    const wetted = pRain + irrNet > 2;
-    const ke = Number((wetted ? Math.max(0.05, currentKc - currentKcb) : 0.06).toFixed(2));
-    const etcPot = Number(((currentKcb + ke) * et0).toFixed(2));
-    const etcAdj = Number(((ks * currentKcb + ke) * et0).toFixed(2));
-
-    const rawEnd = drStart - (pRain - runoff) - irrNet + etcAdj;
-    const dp = rawEnd < 0 ? Number(Math.abs(rawEnd).toFixed(2)) : 0;
-    const drEnd = Number(Math.max(0, Math.min(tawMm, rawEnd)).toFixed(1));
-    const effRain = Number(Math.max(0, pRain - runoff - Math.min(dp, pRain)).toFixed(2));
-    effectiveRain30dMm += effRain;
-
-    const estVwc = Number((pedo.fc - drEnd / (1000 * currentZrM)).toFixed(1));
-
-    dailyBalanceSeries.push({
-      date: day.date,
-      shortDate: day.shortDate,
-      isForecast: false,
-      et0Mm: Number(et0.toFixed(2)),
-      kc: Number(currentKc.toFixed(2)),
-      kcb: Number(currentKcb.toFixed(2)),
-      ke,
-      ks: Number(ks.toFixed(2)),
-      etcPotentialMm: etcPot,
-      etcAdjMm: etcAdj,
-      observedRainMm: Number(pRain.toFixed(1)),
-      forecastRainMm: 0,
-      runoffMm: runoff,
-      effectiveRainMm: effRain,
-      irrigationNetMm: irrNet,
-      deepPercolationMm: dp,
-      drStartMm: Number(drStart.toFixed(1)),
-      drEndMm: drEnd,
-      rawMm,
-      tawMm,
-      moisturePctEst: Math.max(pedo.wp, Math.min(pedo.fc + 5, estVwc)),
-    });
-
-    drPrev = drEnd;
-  }
-
-  // If user has explicit measured moisture on field, anchor current Dr cleanly when history was empty
-  if (dailyBalanceSeries.length === 0 && measuredMoisturePct !== null) {
-    drPrev = Math.max(
-      0,
-      Math.min(tawMm, Math.round(((pedo.fc - measuredMoisturePct) / 100) * 1000 * currentZrM))
-    );
-  }
-  const currentDrMm = Number(drPrev.toFixed(1));
-  const currentKs =
-    currentDrMm <= rawMm
-      ? 1
-      : Number(Math.max(0, Math.min(1, (tawMm - currentDrMm) / Math.max(1, tawMm - rawMm))).toFixed(2));
-
-  // Separate 7-Day Forecast Projection (Section 12.5)
-  let drProj = currentDrMm;
-  let daysUntilRawCrossed: number | null = currentDrMm >= rawMm ? 0 : null;
-  let forecastEtc7dMm = 0;
-
-  forecastSeries.forEach((fc, idx) => {
-    const et0 = fc.et0Mm ?? et0TodayMm ?? 4.2;
-    const drStart = drProj;
-    const ks = drStart <= rawMm ? 1 : Math.max(0, Math.min(1, (tawMm - drStart) / Math.max(1, tawMm - rawMm)));
-    const pFc = fc.precipMm ?? 0;
-    const ke = pFc > 3 ? Math.max(0.05, Number((currentKc - currentKcb).toFixed(2))) : 0.05;
-    const etcPot = Number(((currentKcb + ke) * et0).toFixed(2));
-    const etcAdj = Number(((ks * currentKcb + ke) * et0).toFixed(2));
-    forecastEtc7dMm += etcPot;
-    const rawEnd = drStart - pFc + etcAdj;
-    const dp = rawEnd < 0 ? Number(Math.abs(rawEnd).toFixed(2)) : 0;
-    const drEnd = Number(Math.max(0, Math.min(tawMm, rawEnd)).toFixed(1));
-    if (daysUntilRawCrossed === null && drEnd >= rawMm) {
-      daysUntilRawCrossed = idx + 1;
-    }
-    const estVwc = Number((pedo.fc - drEnd / (1000 * currentZrM)).toFixed(1));
-
-    dailyBalanceSeries.push({
-      date: fc.date,
-      shortDate: fc.shortDate,
-      isForecast: true,
-      et0Mm: Number(et0.toFixed(2)),
-      kc: Number(currentKc.toFixed(2)),
-      kcb: Number(currentKcb.toFixed(2)),
-      ke,
-      ks: Number(ks.toFixed(2)),
-      etcPotentialMm: etcPot,
-      etcAdjMm: etcAdj,
-      observedRainMm: 0,
-      forecastRainMm: Number(pFc.toFixed(1)),
-      runoffMm: 0,
-      effectiveRainMm: 0,
-      irrigationNetMm: 0,
-      deepPercolationMm: dp,
-      drStartMm: Number(drStart.toFixed(1)),
-      drEndMm: drEnd,
-      rawMm,
-      tawMm,
-      moisturePctEst: Math.max(pedo.wp, Math.min(pedo.fc + 5, estVwc)),
-    });
-    drProj = drEnd;
-  });
-
-  // Irrigation Scheduling Math (Section 13)
-  const triggerActive = currentDrMm >= rawMm || (daysUntilRawCrossed !== null && daysUntilRawCrossed <= 2);
-  const targetPostIrrigationDr = Math.round(rawMm * 0.25);
-  const netRefillMm = triggerActive
-    ? Number(Math.max(0, Math.min(currentDrMm, currentDrMm - targetPostIrrigationDr)).toFixed(1))
-    : 0;
   const irrMethod = field?.waterOverrides?.irrigationMethod || farm.water.irrigationMethod || 'Drip irrigation';
   const assumedEa =
     irrMethod.includes('Drip')
@@ -1153,8 +1038,6 @@ export function buildFieldAgronomyBundle(params: {
           ? 0.62
           : 0.75;
   const eaSourceLabel = `${irrMethod} assumed textbook Ea = ${(assumedEa * 100).toFixed(0)}% (uncalibrated)`;
-  const grossDepthMm = netRefillMm > 0 ? Number((netRefillMm / assumedEa).toFixed(1)) : 0;
-  const recommendedVolumeM3 = Math.round(grossDepthMm * areaHa * 10);
 
   const flowRateKnown = Boolean(farm.water.dailyCapacityKnown && farm.water.dailyCapacityM3);
   const infiltrationKnown = false; // No soil infiltration audit in record yet
@@ -1162,10 +1045,173 @@ export function buildFieldAgronomyBundle(params: {
     ? 'Exact pump runtime & pulse cycles unavailable: confirm zone flow rate (m³/h) and soil infiltration audit first.'
     : 'Daily capacity exists at farm level, but exact zone flow rate (m³/h) and soil intake rate are required for pulse splitting.';
 
-  const estimatedMoistureVwcPct =
-    measuredMoisturePct !== null
-      ? Number(measuredMoisturePct.toFixed(1))
-      : Number(Math.max(pedo.wp, Math.min(pedo.fc, pedo.fc - (currentDrMm / (1000 * currentZrM)) * 100)).toFixed(1));
+  const dailyBalanceSeries: DailyWaterBalancePoint[] = [];
+  let effectiveRain30dMm = 0;
+  let confirmedIrrigation30dMm = 0;
+  let forecastEtc7dMm = 0;
+  const balanceWindow = pastSeries.slice(-21);
+
+  let tawMm: number | null = null;
+  let rawMm: number | null = null;
+  let currentDrMm: number | null = null;
+  let currentKs: number | null = null;
+  let daysUntilRawCrossed: number | null = null;
+  let triggerActive = false;
+  let netRefillMm: number | null = null;
+  let grossDepthMm: number | null = null;
+  let recommendedVolumeM3: number | null = null;
+  let estimatedMoistureVwcPct: number | null = null;
+
+  if (pedo) {
+    tawMm = Math.round(1000 * ((pedo.fc - pedo.wp) / 100) * currentZrM);
+    rawMm = Math.round(pAdjusted * tawMm);
+
+    let drPrev =
+      vwcCompatibleMoisturePct !== null
+        ? Math.max(0, Math.min(tawMm, Math.round(((pedo.fc - vwcCompatibleMoisturePct) / 100) * 1000 * currentZrM)))
+        : Math.round(tawMm * 0.34);
+
+    // Observed / Reanalysis historical water balance
+    for (const day of balanceWindow) {
+      const et0 = day.et0Mm ?? 4.0;
+      const drStart = drPrev;
+      const ks = drStart <= rawMm ? 1 : Math.max(0, Math.min(1, (tawMm - drStart) / Math.max(1, tawMm - rawMm)));
+      const pRain = day.precipMm ?? 0;
+      const irrNet = Number((irrByDate.get(day.date) ?? 0).toFixed(2));
+      confirmedIrrigation30dMm += irrNet;
+
+      // Simple runoff threshold when daily rain > 22 mm on low drainage/high slope
+      const slopeFactor = (soilProfile.slopePct ?? 2) > 5 ? 0.18 : 0.08;
+      const runoff = pRain > 22 ? Number(((pRain - 22) * slopeFactor).toFixed(2)) : 0;
+
+      // Surface evaporation Ke pulses gently after wetting events, capped by Kc_max
+      const wetted = pRain + irrNet > 2;
+      const ke = Number((wetted ? Math.max(0.05, currentKc - currentKcb) : 0.06).toFixed(2));
+      const etcPot = Number(((currentKcb + ke) * et0).toFixed(2));
+      const etcAdj = Number(((ks * currentKcb + ke) * et0).toFixed(2));
+
+      const rawEnd = drStart - (pRain - runoff) - irrNet + etcAdj;
+      const dp = rawEnd < 0 ? Number(Math.abs(rawEnd).toFixed(2)) : 0;
+      const drEnd = Number(Math.max(0, Math.min(tawMm, rawEnd)).toFixed(1));
+      const effRain = Number(Math.max(0, pRain - runoff - Math.min(dp, pRain)).toFixed(2));
+      effectiveRain30dMm += effRain;
+
+      const estVwc = Number((pedo.fc - drEnd / (1000 * currentZrM)).toFixed(1));
+
+      dailyBalanceSeries.push({
+        date: day.date,
+        shortDate: day.shortDate,
+        isForecast: false,
+        et0Mm: Number(et0.toFixed(2)),
+        kc: Number(currentKc.toFixed(2)),
+        kcb: Number(currentKcb.toFixed(2)),
+        ke,
+        ks: Number(ks.toFixed(2)),
+        etcPotentialMm: etcPot,
+        etcAdjMm: etcAdj,
+        observedRainMm: Number(pRain.toFixed(1)),
+        forecastRainMm: 0,
+        runoffMm: runoff,
+        effectiveRainMm: effRain,
+        irrigationNetMm: irrNet,
+        deepPercolationMm: dp,
+        drStartMm: Number(drStart.toFixed(1)),
+        drEndMm: drEnd,
+        rawMm,
+        tawMm,
+        moisturePctEst: Math.max(pedo.wp, Math.min(pedo.fc + 5, estVwc)),
+      });
+
+      drPrev = drEnd;
+    }
+
+    // If user has explicit VWC measured moisture on field, anchor current Dr cleanly when history was empty
+    if (dailyBalanceSeries.length === 0 && vwcCompatibleMoisturePct !== null) {
+      drPrev = Math.max(
+        0,
+        Math.min(tawMm, Math.round(((pedo.fc - vwcCompatibleMoisturePct) / 100) * 1000 * currentZrM))
+      );
+    }
+    currentDrMm = Number(drPrev.toFixed(1));
+    currentKs =
+      currentDrMm <= rawMm
+        ? 1
+        : Number(Math.max(0, Math.min(1, (tawMm - currentDrMm) / Math.max(1, tawMm - rawMm))).toFixed(2));
+
+    // Separate 7-Day Forecast Projection (Section 12.5)
+    let drProj = currentDrMm;
+    daysUntilRawCrossed = currentDrMm >= rawMm ? 0 : null;
+
+    forecastSeries.forEach((fc, idx) => {
+      const et0 = fc.et0Mm ?? et0TodayMm ?? 4.2;
+      const drStart = drProj;
+      const ks = drStart <= rawMm! ? 1 : Math.max(0, Math.min(1, (tawMm! - drStart) / Math.max(1, tawMm! - rawMm!)));
+      const pFc = fc.precipMm ?? 0;
+      const ke = pFc > 3 ? Math.max(0.05, Number((currentKc - currentKcb).toFixed(2))) : 0.05;
+      const etcPot = Number(((currentKcb + ke) * et0).toFixed(2));
+      const etcAdj = Number(((ks * currentKcb + ke) * et0).toFixed(2));
+      forecastEtc7dMm += etcPot;
+      const rawEnd = drStart - pFc + etcAdj;
+      const dp = rawEnd < 0 ? Number(Math.abs(rawEnd).toFixed(2)) : 0;
+      const drEnd = Number(Math.max(0, Math.min(tawMm!, rawEnd)).toFixed(1));
+      if (daysUntilRawCrossed === null && drEnd >= rawMm!) {
+        daysUntilRawCrossed = idx + 1;
+      }
+      const estVwc = Number((pedo.fc - drEnd / (1000 * currentZrM)).toFixed(1));
+
+      dailyBalanceSeries.push({
+        date: fc.date,
+        shortDate: fc.shortDate,
+        isForecast: true,
+        et0Mm: Number(et0.toFixed(2)),
+        kc: Number(currentKc.toFixed(2)),
+        kcb: Number(currentKcb.toFixed(2)),
+        ke,
+        ks: Number(ks.toFixed(2)),
+        etcPotentialMm: etcPot,
+        etcAdjMm: etcAdj,
+        observedRainMm: 0,
+        forecastRainMm: Number(pFc.toFixed(1)),
+        runoffMm: 0,
+        effectiveRainMm: 0,
+        irrigationNetMm: 0,
+        deepPercolationMm: dp,
+        drStartMm: Number(drStart.toFixed(1)),
+        drEndMm: drEnd,
+        rawMm: rawMm!,
+        tawMm: tawMm!,
+        moisturePctEst: Math.max(pedo.wp, Math.min(pedo.fc + 5, estVwc)),
+      });
+      drProj = drEnd;
+    });
+
+    // Irrigation Scheduling Math (Section 13)
+    triggerActive = currentDrMm >= rawMm || (daysUntilRawCrossed !== null && daysUntilRawCrossed <= 2);
+    const targetPostIrrigationDr = Math.round(rawMm * 0.25);
+    netRefillMm = triggerActive
+      ? Number(Math.max(0, Math.min(currentDrMm, currentDrMm - targetPostIrrigationDr)).toFixed(1))
+      : 0;
+    grossDepthMm = netRefillMm > 0 ? Number((netRefillMm / assumedEa).toFixed(1)) : 0;
+    recommendedVolumeM3 = Math.round(grossDepthMm * areaHa * 10);
+
+    estimatedMoistureVwcPct =
+      vwcCompatibleMoisturePct !== null
+        ? Number(vwcCompatibleMoisturePct.toFixed(1))
+        : Number(Math.max(pedo.wp, Math.min(pedo.fc, pedo.fc - (currentDrMm / (1000 * currentZrM)) * 100)).toFixed(1));
+  } else {
+    // Unknown soil texture: preserve irrigation logs and atmospheric ETc demand without fabricating soil hydraulics
+    for (const day of balanceWindow) {
+      confirmedIrrigation30dMm += Number((irrByDate.get(day.date) ?? 0).toFixed(2));
+    }
+    forecastSeries.forEach((fc) => {
+      const et0 = fc.et0Mm ?? et0TodayMm;
+      if (et0 !== null) {
+        const pFc = fc.precipMm ?? 0;
+        const ke = pFc > 3 ? Math.max(0.05, Number((currentKc - currentKcb).toFixed(2))) : 0.05;
+        forecastEtc7dMm += Number(((currentKcb + ke) * et0).toFixed(2));
+      }
+    });
+  }
 
   // Nutrient Budget Prerequisites (Section 15)
   const targetYield = crop.uptakePerTonneKg.targetYieldBasisTHa;
@@ -1187,41 +1233,43 @@ export function buildFieldAgronomyBundle(params: {
 
   // Risks Evaluation (Section 17)
   const risks: EvaluatedFieldRisk[] = [];
-  if (currentDrMm >= rawMm) {
-    risks.push({
-      id: 'risk-water-depletion',
-      ruleId: 'FAO56-WB-01',
-      domain: 'Water',
-      title: 'Root-Zone Depletion Exceeds RAW',
-      severity: currentDrMm >= tawMm * 0.85 ? 'Critical' : 'High',
-      confidence: measuredMoisturePct !== null ? 'High' : 'Moderate',
-      thresholdVsActual: `Depletion Dr ${currentDrMm} mm ≥ RAW ${rawMm} mm (Ks = ${currentKs.toFixed(2)})`,
-      plausibleMechanism: 'Transpiration exceeds soil water entry; stomatal closure may limit photosynthesis if unrefilled.',
-      competingExplanations: 'Gridded rainfall or unrecorded irrigation event could place actual Dr below modelled value.',
-      mitigationSteps: [
-        `Inspect root-zone moisture in ${fieldCode} across 0–30 cm depth.`,
-        netRefillMm > 0
-          ? `Review ${netRefillMm} mm net refill (~${recommendedVolumeM3.toLocaleString()} m³ gross across ${areaHa.toFixed(1)} ha).`
-          : 'Log recent irrigation events if already watered.',
-      ],
-      status: 'Active',
-      metricId: 'water_dr',
-    });
-  } else if (daysUntilRawCrossed !== null && daysUntilRawCrossed <= 4) {
-    risks.push({
-      id: 'risk-water-watch',
-      ruleId: 'FAO56-WB-02',
-      domain: 'Water',
-      title: 'Approaching Readily Available Water (RAW) Trigger',
-      severity: 'Moderate',
-      confidence: 'Moderate',
-      thresholdVsActual: `Projected to cross RAW (${rawMm} mm) in ~${daysUntilRawCrossed} day(s) under forecast ETc`,
-      plausibleMechanism: 'Cumulative forecast ETc exceeds forecast precipitation over next 4 days.',
-      competingExplanations: 'Convective forecast showers or subsurface capillary rise could delay onset.',
-      mitigationSteps: ['Schedule field check and confirm irrigation supply availability prior to trigger window.'],
-      status: 'Watch',
-      metricId: 'water_dr',
-    });
+  if (currentDrMm !== null && rawMm !== null && tawMm !== null && currentKs !== null) {
+    if (currentDrMm >= rawMm) {
+      risks.push({
+        id: 'risk-water-depletion',
+        ruleId: 'FAO56-WB-01',
+        domain: 'Water',
+        title: 'Root-Zone Depletion Exceeds RAW',
+        severity: currentDrMm >= tawMm * 0.85 ? 'Critical' : 'High',
+        confidence: vwcCompatibleMoisturePct !== null ? 'High' : 'Moderate',
+        thresholdVsActual: `Depletion Dr ${currentDrMm} mm ≥ RAW ${rawMm} mm (Ks = ${currentKs.toFixed(2)})`,
+        plausibleMechanism: 'Transpiration exceeds soil water entry; stomatal closure may limit photosynthesis if unrefilled.',
+        competingExplanations: 'Gridded rainfall or unrecorded irrigation event could place actual Dr below modelled value.',
+        mitigationSteps: [
+          `Inspect root-zone moisture in ${fieldCode} across 0–30 cm depth.`,
+          netRefillMm !== null && netRefillMm > 0 && recommendedVolumeM3 !== null
+            ? `Review ${netRefillMm} mm net refill (~${recommendedVolumeM3.toLocaleString()} m³ gross across ${areaHa.toFixed(1)} ha).`
+            : 'Log recent irrigation events if already watered.',
+        ],
+        status: 'Active',
+        metricId: 'water_dr',
+      });
+    } else if (daysUntilRawCrossed !== null && daysUntilRawCrossed <= 4) {
+      risks.push({
+        id: 'risk-water-watch',
+        ruleId: 'FAO56-WB-02',
+        domain: 'Water',
+        title: 'Approaching Readily Available Water (RAW) Trigger',
+        severity: 'Moderate',
+        confidence: 'Moderate',
+        thresholdVsActual: `Projected to cross RAW (${rawMm} mm) in ~${daysUntilRawCrossed} day(s) under forecast ETc`,
+        plausibleMechanism: 'Cumulative forecast ETc exceeds forecast precipitation over next 4 days.',
+        competingExplanations: 'Convective forecast showers or subsurface capillary rise could delay onset.',
+        mitigationSteps: ['Schedule field check and confirm irrigation supply availability prior to trigger window.'],
+        status: 'Watch',
+        metricId: 'water_dr',
+      });
+    }
   }
 
   if (heatStressDays30d > 0) {
@@ -1320,7 +1368,6 @@ export function buildFieldAgronomyBundle(params: {
         `Heat exceedance days in past 30d: ${heatStressDays30d} day(s).`,
       ],
       confidenceLevel: curTemp !== null ? 'Moderate' : 'Unavailable',
-      confidencePct: curTemp !== null ? 78 : 0,
       limitations: 'Gridded NWP air temperature may differ by 1–3 °C from microclimate inside dense irrigated canopies.',
       relatedContext: `${fieldDisplayName} · ${crop.commonName}`,
     },
@@ -1358,7 +1405,6 @@ export function buildFieldAgronomyBundle(params: {
           ]
         : ['Provider-supplied FAO-56 ET0 from Open-Meteo model grid.'],
       confidenceLevel: et0TodayMm !== null ? 'High' : 'Unavailable',
-      confidencePct: et0TodayMm !== null ? 84 : 0,
       limitations: 'Uses gridded solar radiation and wind adjusted from 10 m height; local windbreaks or advective oasis effects are unmeasured.',
       relatedContext: `${fieldDisplayName} · ${et0MethodLabel}`,
     },
@@ -1388,41 +1434,82 @@ export function buildFieldAgronomyBundle(params: {
         `Active consecutive dry spell (<1 mm/d): ${drySpellDays} day(s).`,
       ],
       confidenceLevel: pastSeries.length > 0 ? 'Moderate' : 'Unavailable',
-      confidencePct: pastSeries.length > 0 ? 74 : 0,
       limitations: '0.5° grid averages convective storm cells; confirm actual catchment with an in-field rain gauge.',
       relatedContext: `${fieldDisplayName} · Rain deficit check`,
     },
-    water_dr: {
-      id: 'water_dr',
-      title: 'Root-Zone Water Depletion (Dr) vs RAW / TAW',
-      question: 'How close is the crop root zone to water stress and irrigation threshold?',
-      valueDisplay: `${currentDrMm.toFixed(1)} / ${tawMm} mm`,
-      unit: 'mm root-zone depletion (0 = Field Capacity, TAW = Wilting Point)',
-      period: '21-day daily soil-water balance + 7d separate forecast projection',
-      timezone,
-      factType: measuredMoisturePct !== null ? 'Calculated' : 'Modelled',
-      sourceName: 'FAO-56 Chapter 8 Root-Zone Depletion Balance',
-      observationTime: balanceWindow[balanceWindow.length - 1]?.date || retrievedIso,
-      retrievalTime: retrievedIso,
-      spatialResolution: `Field ${areaHa.toFixed(1)} ha with Zr = ${currentZrM.toFixed(2)} m`,
-      fieldCoverageNote: `${soilProfile.texture} pedotransfer parameters (${pedo.fc}% FC, ${pedo.wp}% WP) + ${fieldIrrLogs.length} logged irrigation event(s).`,
-      formulaVersion: 'FAO-56 Ch. 8 Dual-Kc Balance (v1.3)',
-      formulaDisplay: 'Dr_i = clamp(0, TAW, Dr_{i-1} - (P_i - RO_i) - I_i + ETc_adj_i + DP_i); Ks = (TAW - Dr)/(TAW - RAW)',
-      inputs: [
-        { label: 'TAW', value: `${tawMm} mm`, source: `1000 × (${pedo.fc/100} - ${pedo.wp/100}) × ${currentZrM.toFixed(2)} m` },
-        { label: 'RAW (No-stress limit)', value: `${rawMm} mm (p = ${pAdjusted})`, source: `${crop.commonName} ETc-adjusted p` },
-        { label: 'Kcb / Ke / Ks', value: `${currentKcb.toFixed(2)} / 0.06 / ${currentKs.toFixed(2)}`, source: `${stageFao}` },
-        { label: 'Volumetric Conversion', value: `${recommendedVolumeM3.toLocaleString()} m³`, source: `${grossDepthMm} mm × ${areaHa.toFixed(1)} ha × 10` },
-      ],
-      intermediateSteps: [
-        `Potential ETc = ${(et0TodayMm ?? 4.0) * currentKc} mm/d · Adjusted ETc = ${((et0TodayMm ?? 4.0) * (currentKs * currentKcb + 0.06)).toFixed(2)} mm/d.`,
-        `Assumed application efficiency Ea = ${(assumedEa * 100).toFixed(0)}% (${irrMethod}); uncalibrated hardware rate.`,
-      ],
-      confidenceLevel: measuredMoisturePct !== null ? 'Moderate' : 'Low',
-      confidencePct: measuredMoisturePct !== null ? 72 : 52,
-      limitations: 'Exact irrigation runtime/pulses require confirmed zone pump flow (m³/h) and soil infiltration test.',
-      relatedContext: `${fieldDisplayName} · ${irrMethod}`,
-    },
+    water_dr: (() => {
+      const hasHydraulicBalance =
+        pedo !== null &&
+        currentDrMm !== null &&
+        tawMm !== null &&
+        rawMm !== null &&
+        currentKs !== null;
+      const etcPotStr = et0TodayMm !== null ? `${(et0TodayMm * currentKc).toFixed(2)} mm/d` : 'Unavailable';
+      const etcAdjStr =
+        et0TodayMm !== null && currentKs !== null
+          ? `${(et0TodayMm * (currentKs * currentKcb + 0.06)).toFixed(2)} mm/d`
+          : 'Unavailable';
+
+      return {
+        id: 'water_dr',
+        title: 'Root-Zone Water Depletion (Dr) vs RAW / TAW',
+        question: 'How close is the crop root zone to water stress and irrigation threshold?',
+        valueDisplay: hasHydraulicBalance ? `${currentDrMm!.toFixed(1)} / ${tawMm} mm` : 'Unavailable',
+        unit: 'mm root-zone depletion (0 = Field Capacity, TAW = Wilting Point)',
+        period: '21-day daily soil-water balance + 7d separate forecast projection',
+        timezone,
+        factType: hasHydraulicBalance
+          ? vwcCompatibleMoisturePct !== null
+            ? 'Calculated'
+            : 'Modelled'
+          : 'Unavailable',
+        sourceName: 'FAO-56 Chapter 8 Root-Zone Depletion Balance',
+        observationTime: balanceWindow[balanceWindow.length - 1]?.date || retrievedIso,
+        retrievalTime: retrievedIso,
+        spatialResolution: `Field ${areaHa.toFixed(1)} ha with Zr = ${currentZrM.toFixed(2)} m`,
+        fieldCoverageNote: hasHydraulicBalance
+          ? `${soilProfile.texture} pedotransfer parameters (${pedo!.fc}% FC, ${pedo!.wp}% WP) + ${fieldIrrLogs.length} logged irrigation event(s).${effSoil.moistureUnitAmbiguityNote ? ` ${effSoil.moistureUnitAmbiguityNote}` : ''}`
+          : hydraulicAvailabilityReason || 'Soil texture is Unknown; hydraulic capacity and depletion balance unavailable.',
+        formulaVersion: 'FAO-56 Ch. 8 Dual-Kc Balance (v1.3)',
+        formulaDisplay: 'Dr_i = clamp(0, TAW, Dr_{i-1} - (P_i - RO_i) - I_i + ETc_adj_i + DP_i); Ks = (TAW - Dr)/(TAW - RAW)',
+        inputs: hasHydraulicBalance
+          ? [
+              { label: 'TAW', value: `${tawMm} mm`, source: `1000 × (${pedo!.fc / 100} - ${pedo!.wp / 100}) × ${currentZrM.toFixed(2)} m` },
+              { label: 'RAW (No-stress limit)', value: `${rawMm} mm (p = ${pAdjusted})`, source: `${crop.commonName} ETc-adjusted p` },
+              { label: 'Kcb / Ke / Ks', value: `${currentKcb.toFixed(2)} / 0.06 / ${currentKs!.toFixed(2)}`, source: `${stageFao}` },
+              {
+                label: 'Volumetric Conversion',
+                value: `${(recommendedVolumeM3 ?? 0).toLocaleString()} m³`,
+                source: `${grossDepthMm ?? 0} mm × ${areaHa.toFixed(1)} ha × 10`,
+              },
+            ]
+          : [
+              { label: 'Soil Texture', value: soilProfile.texture, source: soilProfile.textureSource },
+              {
+                label: 'Observed Moisture',
+                value: effSoil.moisturePct !== null ? `${effSoil.moisturePct}% (${observedUnitLabel})` : 'Not recorded',
+                source: effSoil.moistureProvenanceLabel,
+              },
+              {
+                label: 'Potential ETc',
+                value: etcPotStr,
+                source: 'ET0 × Kc (independent of soil texture)',
+              },
+            ],
+        intermediateSteps: hasHydraulicBalance
+          ? [
+              `Potential ETc = ${etcPotStr} · Adjusted ETc = ${etcAdjStr}.`,
+              `Assumed application efficiency Ea = ${(assumedEa * 100).toFixed(0)}% (${irrMethod}); uncalibrated hardware rate.`,
+            ]
+          : [
+              'Soil texture is Unknown — field capacity, wilting point, TAW, RAW, and Ks cannot be calculated without fabricating pedotransfer priors.',
+              ...(hydraulicAvailabilityReason ? [hydraulicAvailabilityReason] : []),
+            ],
+        confidenceLevel: hasHydraulicBalance ? (vwcCompatibleMoisturePct !== null ? 'Moderate' : 'Low') : 'Unavailable',
+        limitations: 'Exact irrigation runtime/pulses require confirmed zone pump flow (m³/h) and soil infiltration test.',
+        relatedContext: `${fieldDisplayName} · ${irrMethod}`,
+      };
+    })(),
     soil_nutrients: {
       id: 'soil_nutrients',
       title: 'Soil Profile & Nutrient Budget Readiness',
@@ -1431,12 +1518,14 @@ export function buildFieldAgronomyBundle(params: {
       unit: 'Laboratory chemical & physical basis',
       period: 'Active soil profile version',
       timezone,
-      factType: phVal !== null ? 'Lab-measured' : 'Mapped estimate',
+      factType: phVal !== null ? 'Lab-measured' : 'Unavailable',
       sourceName: 'Field Profile + FAO Nutrient Bookkeeping Rules',
-      observationTime: farm.soil.phTestDate || farm.updatedAt,
+      observationTime: effSoil.phTestDate || farm.updatedAt,
       retrievalTime: retrievedIso,
       spatialResolution: `Parcel-level profile (${areaHa.toFixed(1)} ha)`,
-      fieldCoverageNote: 'ISRIC SoilGrids REST endpoint paused as of 15 Nov 2026; using explicit farmer profile & USDA pedotransfer priors.',
+      fieldCoverageNote: pedo
+        ? 'ISRIC SoilGrids REST endpoint paused as of 15 Nov 2026; using explicit farmer profile & USDA pedotransfer priors.'
+        : 'ISRIC SoilGrids REST endpoint paused as of 15 Nov 2026; using explicit farmer profile (pedotransfer hydraulic priors skipped while soil texture is Unknown).',
       formulaVersion: AGRONOMY_ENGINE_VERSION,
       formulaDisplay: 'Fertilizer_rate = max(0, Crop_req - Soil_supply - Residue_credit - Manure_credit - Water_credit) / Recovery',
       inputs: [
@@ -1450,7 +1539,6 @@ export function buildFieldAgronomyBundle(params: {
         'Crop uptake cannot prescribe fertilizer doses without soil-test supply and recovery calibration.',
       ],
       confidenceLevel: 'Low',
-      confidencePct: phVal !== null ? 48 : 30,
       limitations: 'Fertilizer kg/ha prescription deliberately suppressed per non-negotiable agronomy safety rules until soil lab results exist.',
       relatedContext: `${fieldDisplayName} · ${crop.commonName}`,
     },
@@ -1463,16 +1551,27 @@ export function buildFieldAgronomyBundle(params: {
     `Forecast rainfall for the next 7 days (${forecastRain7dMm.toFixed(1)} mm) is tracked strictly separately from observed history so water accounting never mixes predictions into past catch totals.`,
   ];
 
-  const waterSummary = [
-    `At ${stageLabel} (${stageFao}, Zr ≈ ${currentZrM.toFixed(2)} m), ${soilProfile.texture} holds an estimated Total Available Water (TAW) of ${tawMm} mm and Readily Available Water (RAW) of ${rawMm} mm (demand-adjusted p = ${pAdjusted}).`,
-    `Current modelled root-zone depletion stands at Dr = ${currentDrMm.toFixed(1)} mm (${Math.round((currentDrMm / Math.max(1, tawMm)) * 100)}% of TAW), giving water-stress factor Ks = ${currentKs.toFixed(2)} and daily crop demand ETc = ${((et0TodayMm ?? 4.0) * currentKc).toFixed(2)} mm/day.`,
-    triggerActive
-      ? `Scheduling trigger is active (Dr approaching/exceeding RAW): recommended net refill is ${netRefillMm} mm (${grossDepthMm} mm gross at ${(assumedEa * 100).toFixed(0)}% assumed ${irrMethod} efficiency = ${recommendedVolumeM3.toLocaleString()} m³). ${runtimeNote}`
-      : `Depletion remains inside the RAW comfort buffer (${daysUntilRawCrossed !== null ? `projected to cross RAW in ~${daysUntilRawCrossed} day(s)` : 'stable across next 7 days'}); no immediate refill required.`,
-  ];
+  const waterSummary =
+    pedo !== null && tawMm !== null && rawMm !== null && currentDrMm !== null && currentKs !== null
+      ? [
+          `At ${stageLabel} (${stageFao}, Zr ≈ ${currentZrM.toFixed(2)} m), ${soilProfile.texture} holds an estimated Total Available Water (TAW) of ${tawMm} mm and Readily Available Water (RAW) of ${rawMm} mm (demand-adjusted p = ${pAdjusted}).`,
+          `Current modelled root-zone depletion stands at Dr = ${currentDrMm.toFixed(1)} mm (${Math.round((currentDrMm / Math.max(1, tawMm)) * 100)}% of TAW), giving water-stress factor Ks = ${currentKs.toFixed(2)} and daily crop demand ${et0TodayMm !== null ? `ETc = ${(et0TodayMm * currentKc).toFixed(2)} mm/day` : 'ETc unavailable until ET0 inputs load'}.${effSoil.moistureUnitAmbiguityNote ? ` ${effSoil.moistureUnitAmbiguityNote}` : ''}`,
+          triggerActive
+            ? `Scheduling trigger is active (Dr approaching/exceeding RAW): recommended net refill is ${netRefillMm ?? 0} mm (${grossDepthMm ?? 0} mm gross at ${(assumedEa * 100).toFixed(0)}% assumed ${irrMethod} efficiency = ${(recommendedVolumeM3 ?? 0).toLocaleString()} m³). ${runtimeNote}`
+            : `Depletion remains inside the RAW comfort buffer (${daysUntilRawCrossed !== null ? `projected to cross RAW in ~${daysUntilRawCrossed} day(s)` : 'stable across next 7 days'}); no immediate refill required.`,
+        ]
+      : [
+          `At ${stageLabel} (${stageFao}, Zr ≈ ${currentZrM.toFixed(2)} m), soil texture is Unknown so Total Available Water (TAW) and Readily Available Water (RAW) cannot be calculated without fabricating hydraulic priors.`,
+          `Current crop evaporative demand is ${et0TodayMm !== null ? `ETc = ${(et0TodayMm * currentKc).toFixed(2)} mm/day (ET0 ${et0TodayMm.toFixed(2)} mm/day × Kc ${currentKc.toFixed(2)})` : 'unavailable until ET0 inputs load'}, with ${forecastEtc7dMm.toFixed(1)} mm projected over the next 7 days.`,
+          effSoil.moisturePct !== null
+            ? `Recorded soil moisture (${effSoil.moisturePct}% ${observedUnitLabel}) is preserved for display.${effSoil.moistureUnitAmbiguityNote ? ` ${effSoil.moistureUnitAmbiguityNote}` : ''}`
+            : 'Confirm field soil texture and volumetric moisture (% VWC) to activate root-zone depletion scheduling.',
+        ];
 
   const soilCropSummary = [
-    `Soil profile is ${soilProfile.texture} (${soilProfile.textureSource}) with pedotransfer estimates of ${pedo.fc}% Field Capacity and ${pedo.wp}% Wilting Point (${soilProfile.awcMmPerM} mm/m available water capacity). Soil pH is ${soilProfile.phStatusLabel}.`,
+    pedo !== null
+      ? `Soil profile is ${soilProfile.texture} (${soilProfile.textureSource}) with pedotransfer estimates of ${pedo.fc}% Field Capacity and ${pedo.wp}% Wilting Point (${soilProfile.awcMmPerM} mm/m available water capacity). Soil pH is ${soilProfile.phStatusLabel}. Drainage is ${soilProfile.drainage}.`
+      : `Soil texture is Unknown (${soilProfile.textureSource}); hydraulic Field Capacity, Wilting Point, and AWC are marked unavailable rather than defaulted to Loam priors. Soil pH is ${soilProfile.phStatusLabel}. Drainage is ${soilProfile.drainage}.`,
     `Note on regional soil maps: ISRIC SoilGrids REST API is publicly paused as of 15 Nov 2026; therefore Soil & Land keeps regional maps marked unavailable rather than faking lab accuracy.`,
     `Nutrient fertilisation prescriptions (N, P, K) remain gated until field soil-test concentrations, extraction method, and target yield calibration are provided. Reference whole-plant uptake at ${targetYield} t/ha is shown solely as educational context.`,
   ];
@@ -1546,12 +1645,23 @@ export function buildFieldAgronomyBundle(params: {
       tawMm,
       rawMm,
       currentDrMm,
-      depletionPctOfTaw: Math.round((currentDrMm / Math.max(1, tawMm)) * 100),
+      depletionPctOfTaw:
+        currentDrMm !== null && tawMm !== null ? Math.round((currentDrMm / Math.max(1, tawMm)) * 100) : null,
       estimatedMoistureVwcPct,
+      observedMoisturePct: effSoil.moisturePct,
+      observedMoistureUnit: effSoil.moistureUnit,
+      observedMoistureDepth: effSoil.moistureDepth,
+      observedMoistureMethod: effSoil.moistureMethod,
+      observedMoistureDate: effSoil.moistureDate,
+      moistureUnitAmbiguityNote: effSoil.moistureUnitAmbiguityNote,
+      hydraulicAvailabilityReason,
       moistureSourceLabel,
       currentKs,
-      etcPotentialMmDay: Number(((et0TodayMm ?? 4.0) * currentKc).toFixed(2)),
-      etcAdjMmDay: Number(((et0TodayMm ?? 4.0) * (currentKs * currentKcb + 0.06)).toFixed(2)),
+      etcPotentialMmDay: et0TodayMm !== null ? Number((et0TodayMm * currentKc).toFixed(2)) : null,
+      etcAdjMmDay:
+        et0TodayMm !== null && currentKs !== null
+          ? Number((et0TodayMm * (currentKs * currentKcb + 0.06)).toFixed(2))
+          : null,
       observedRain30dMm: rainObserved30dMm,
       effectiveRain30dMm: Number(effectiveRain30dMm.toFixed(1)),
       confirmedIrrigation30dMm: Number(confirmedIrrigation30dMm.toFixed(1)),
@@ -1589,7 +1699,7 @@ export function buildFieldAgronomyBundle(params: {
         null,
       eonetFetchedAt: eonetResult?.fetchedAt || null,
       soilUpdatedAt: field?.updatedAt || farm.updatedAt,
-      phTestDate: farm.soil.phTestDate || null,
+      phTestDate: effSoil.phTestDate || null,
       pastWindowStart: pastSeries[0]?.date || null,
       pastWindowEnd: pastSeries[pastSeries.length - 1]?.date || null,
       forecastStart: forecastSeries[0]?.date || null,

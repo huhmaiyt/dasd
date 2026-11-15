@@ -9,6 +9,7 @@ import {
   PlanningHorizon,
   RainfallFrequency,
   SoilMoistureStatus,
+  SoilMoistureUnit,
   SoilPhStatus,
   SoilTexture,
   WateringMethod,
@@ -75,7 +76,7 @@ export interface RotationCandidateOption {
   id: string;
   title: string;
   suitabilityScore: number; // 0-100 suitability score (kept separate from data confidence)
-  confidencePct: number; // 0-100 data completeness/confidence
+  confidencePct?: number; // Legacy optional field (Stage 1A removes unsupported confidence fabrication)
   primaryBenefit: string;
   waterDemandImpact: 'Reduces demand' | 'Neutral' | 'Increases demand';
   waterDemandMmEstimate: number | null;
@@ -127,6 +128,8 @@ export interface SoilLandProfile {
   texture: SoilTexture;
   moistureStatus: SoilMoistureStatus;
   moisturePct: number | null;
+  moistureUnit?: SoilMoistureUnit;
+  moistureDepth?: string;
   moistureMethod: string;
   moistureDate: string;
   phStatus: SoilPhStatus;
@@ -161,7 +164,7 @@ export interface MyFarmAssessment {
   status: PortfolioStatus;
   freshnessState: FarmFreshnessState;
   score: number | null;
-  confidencePct: number;
+  confidencePct?: number;
   completenessPct: number;
   assessedAt: string | null;
   activeAlertsCount: number;
@@ -222,8 +225,13 @@ export interface PortfolioFieldRecord {
     texture?: SoilTexture;
     moistureStatus?: SoilMoistureStatus;
     moisturePct?: number | null;
+    moistureUnit?: SoilMoistureUnit;
+    moistureDepth?: string;
+    moistureMethod?: string;
+    moistureDate?: string;
     phStatus?: SoilPhStatus;
     phValue?: number | null;
+    phTestDate?: string;
     drainage?: DrainageRate;
   };
   waterOverrides?: {
@@ -293,7 +301,7 @@ export interface SavedFarmSnapshot {
   modelVersion: string;
   triggerReason: string;
   suitabilityScore: number | null;
-  confidencePct: number;
+  confidencePct?: number;
   completenessPct: number;
   weatherWindowSummary: string;
   dataAvailability: {

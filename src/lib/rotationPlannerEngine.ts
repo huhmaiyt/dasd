@@ -4,6 +4,7 @@ import {
   AreaUnit,
   DrainageRate,
   PlanningHorizon,
+  SoilMoistureUnit,
   SoilTexture,
   WaterReliability,
   WaterSource,
@@ -15,6 +16,7 @@ import {
   PortfolioFieldRecord,
   RotationCandidateOption,
 } from '../types/myFarms';
+import { resolveEffectiveFieldSoil } from './soilProvenance';
 
 export type ProvenanceStatus =
   | 'farmer_reported'
@@ -50,6 +52,12 @@ export interface RotationWizardDraft {
   soilPhProvenance: ProvenanceStatus;
   drainage: DrainageRate;
   soilMoisturePct: number | null;
+  soilMoistureStatus?: 'measured' | 'estimated' | 'unknown';
+  soilMoistureUnit?: SoilMoistureUnit;
+  soilMoistureDepth?: string;
+  soilMoistureMethod?: string;
+  soilMoistureDate?: string;
+  moistureUnitAmbiguityNote?: string | null;
   soilOrganicMatterPct: number | null;
   waterSourceSummary: string;
   waterSources: WaterSource[];
@@ -133,7 +141,7 @@ export interface RotationPlanCandidate {
   subtitle: string;
   matchScore: number; // 0-100 composite preference match (explicitly NOT yield %)
   uncertaintyMarginPts: number; // e.g. ±4 pts
-  confidencePct: number; // 0-100 evidence completeness/confidence (kept separate!)
+  confidencePct?: number; // deprecated synthetic field omitted by Batch B
   confidenceReason: string;
   dataGaps: string[];
   isRecommended: boolean;
@@ -174,7 +182,7 @@ export interface CropSuitabilityEvaluation {
   botanicalFamily: string;
   matchScore: number | null; // null if excluded or insufficient
   status: 'eligible' | 'caution' | 'unsuitable' | 'excluded' | 'insufficient';
-  confidencePct: number;
+  confidencePct?: number;
   limitingFactor: string;
   plainSummary: string;
   factors: Array<{
@@ -402,7 +410,7 @@ function summarizeWaterMethod(farm: MyFarmRecord): string {
   if (farm.water.sources.length > 0 && farm.water.sources[0] !== 'Unknown') {
     return farm.water.sources.slice(0, 2).join(' + ');
   }
-  return 'Rain + Irrigation';
+  return 'Water supply not specified';
 }
 
 export function buildInitialRotationDraft(
@@ -428,12 +436,8 @@ export function buildInitialRotationDraft(
   }));
 
   const horizons = parseHorizonSeasons(farm.planningHorizon);
-  const soilTexture: SoilTexture =
-    targetField?.soilOverrides?.texture && targetField.soilOverrides.texture !== 'Unknown'
-      ? targetField.soilOverrides.texture
-      : farm.soil.texture && farm.soil.texture !== 'Unknown'
-        ? farm.soil.texture
-        : 'Loam';
+  const effSoil = resolveEffectiveFieldSoil(farm.soil, targetField?.soilOverrides);
+  const soilTexture: SoilTexture = effSoil.texture;
 
   const mappedPriorities: RotationPriorityWeights = {
     waterSaving: farm.priorities.some((p) => p.toLowerCase().includes('water')) ? 28 : 20,
@@ -454,23 +458,31 @@ export function buildInitialRotationDraft(
     fieldName: targetField?.name || `${farm.name} — Primary Block`,
     soilTexture,
     soilTextureProvenance:
-      farm.soil.texture && farm.soil.texture !== 'Unknown' ? 'from_field_data' : 'estimated',
-    soilPh: targetField?.soilOverrides?.phValue ?? farm.soil.phValue ?? 6.6,
+      soilTexture !== 'Unknown' ? 'from_field_data' : 'unknown',
+    soilPh: effSoil.phValue,
     soilPhProvenance:
-      farm.soil.phStatus === 'tested' && farm.soil.phValue !== null
-        ? 'farmer_confirmed'
-        : 'estimated',
-    drainage: targetField?.soilOverrides?.drainage ?? farm.soil.drainage ?? 'Moderately',
-    soilMoisturePct: targetField?.soilOverrides?.moisturePct ?? farm.soil.moisturePct ?? 24,
-    soilOrganicMatterPct: farm.soil.organicMatterPct ?? 2.3,
+      effSoil.phValue !== null
+        ? effSoil.phStatus === 'tested'
+          ? 'farmer_confirmed'
+          : 'farmer_reported'
+        : 'unknown',
+    drainage: effSoil.drainage,
+    soilMoisturePct: effSoil.moisturePct,
+    soilMoistureStatus: effSoil.moistureStatus,
+    soilMoistureUnit: effSoil.moistureUnit,
+    soilMoistureDepth: effSoil.moistureDepth,
+    soilMoistureMethod: effSoil.moistureMethod,
+    soilMoistureDate: effSoil.moistureDate,
+    moistureUnitAmbiguityNote: effSoil.moistureUnitAmbiguityNote,
+    soilOrganicMatterPct: effSoil.organicMatterPct,
     waterSourceSummary: summarizeWaterMethod(farm),
-    waterSources: farm.water.sources.length ? farm.water.sources : ['Rainwater collection'],
-    wateringMethod: farm.water.wateringMethod || 'Hybrid (rainfall and irrigation)',
-    waterReliability: farm.water.reliability || 'Always available',
+    waterSources: farm.water.sources.length ? farm.water.sources : [],
+    wateringMethod: farm.water.wateringMethod || '',
+    waterReliability: farm.water.reliability || 'Unknown',
     dailyWaterCapM3: farm.water.dailyCapacityKnown ? farm.water.dailyCapacityM3 : null,
     waterEcDsM: farm.water.ecDsM ?? null,
     waterProvenance:
-      farm.water.wateringMethod || farm.water.sources.length ? 'farmer_reported' : 'estimated',
+      farm.water.wateringMethod || farm.water.sources.length ? 'farmer_reported' : 'unknown',
     recentCrops,
     recentCropDisplay: `${primaryCropName} (${currentYear})`,
     recentCropYear: currentYear,
@@ -842,7 +854,7 @@ function deterministicHash(str: string): string {
 
 /**
  * Evaluates single-crop suitability for the given field inputs using a weighted geometric
- * aggregation with limiting-factor cap. Missing inputs transparently reduce confidencePct
+ * aggregation with limiting-factor cap. Missing inputs are tracked in missingToImprove
  * rather than assuming ideal conditions.
  */
 export function evaluateSingleCropSuitability(
@@ -864,13 +876,11 @@ export function evaluateSingleCropSuitability(
     const catalog = findCropCatalogItem(cropId);
     const isExcluded = excludedSet.has(cropId) || excludedSet.has(spec.name.toLowerCase());
 
-    let confidenceWeight = 36; // baseline for crop KB parameters
     const missingToImprove: string[] = [];
 
     // 1. Temperature / GDD factor
     let tempScore: number | null = null;
     if (tempC !== null) {
-      confidenceWeight += 18;
       if (tempC >= spec.optTempRange[0] && tempC <= spec.optTempRange[1]) {
         tempScore = 92;
       } else {
@@ -883,7 +893,6 @@ export function evaluateSingleCropSuitability(
     }
 
     // 2. Water availability match
-    confidenceWeight += draft.waterProvenance === 'unknown' ? 4 : 18;
     let waterScore = 88;
     if (spec.waterNeedBand === 'High') {
       waterScore = isSevereDrought ? 38 : isWaterLimited ? 56 : 86;
@@ -899,7 +908,6 @@ export function evaluateSingleCropSuitability(
     // 3. Soil Texture
     let texScore: number | null = null;
     if (draft.soilTexture && draft.soilTexture !== 'Unknown') {
-      confidenceWeight += 12;
       if (draft.soilTexture === 'Loam' || draft.soilTexture === 'Silt loam') texScore = 94;
       else if (draft.soilTexture === 'Sandy loam' || draft.soilTexture === 'Clay loam') texScore = 85;
       else if (draft.soilTexture === 'Sandy') texScore = spec.waterNeedBand === 'Low' ? 76 : 58;
@@ -911,7 +919,6 @@ export function evaluateSingleCropSuitability(
     // 4. Soil pH
     let phScore: number | null = null;
     if (draft.soilPh !== null) {
-      confidenceWeight += 10;
       const [minPh, maxPh] = spec.optPhRange;
       if (draft.soilPh >= minPh && draft.soilPh <= maxPh) {
         phScore = 94;
@@ -926,7 +933,6 @@ export function evaluateSingleCropSuitability(
     // 5. Drainage
     let drainScore: number | null = null;
     if (draft.drainage && draft.drainage !== 'Unknown') {
-      confidenceWeight += 6;
       drainScore = spec.drainagePrefs.includes(draft.drainage)
         ? 92
         : draft.drainage === 'Very slowly'
@@ -974,7 +980,7 @@ export function evaluateSingleCropSuitability(
         score: waterScore,
         statusText: `${spec.waterNeedBand} demand (~${spec.baseEtcMm} mm)`,
         detail: `Evaluated against ${draft.waterSourceSummary} (${draft.waterReliability}).`,
-        provenance: draft.waterProvenance === 'estimated' ? 'Modelled estimate' : 'Farmer input',
+        provenance: draft.waterProvenance === 'unknown' ? 'Unavailable' : draft.waterProvenance === 'estimated' ? 'Modelled estimate' : 'Farmer input',
       },
       {
         key: 'soil_texture',
@@ -983,8 +989,8 @@ export function evaluateSingleCropSuitability(
         statusText: draft.soilTexture !== 'Unknown' ? draft.soilTexture : 'Unknown texture',
         detail: texScore !== null
           ? `${draft.soilTexture} profile scored for root anchorage and available water holding capacity.`
-          : 'Not entered — confidence reduced until soil texture is supplied.',
-        provenance: draft.soilTextureProvenance === 'from_field_data' ? 'Field record' : 'Modelled',
+          : 'Not entered — soil texture evaluation unavailable until supplied.',
+        provenance: draft.soilTextureProvenance === 'from_field_data' ? 'Field record' : 'Unavailable',
       },
       {
         key: 'ph',
@@ -992,7 +998,12 @@ export function evaluateSingleCropSuitability(
         score: phScore,
         statusText: draft.soilPh !== null ? `pH ${draft.soilPh.toFixed(1)}` : 'Not tested',
         detail: `Preferred soil pH range is ${spec.optPhRange[0]}–${spec.optPhRange[1]}.`,
-        provenance: draft.soilPhProvenance === 'farmer_confirmed' ? 'Lab / probe test' : 'Estimated baseline',
+        provenance:
+          draft.soilPhProvenance === 'farmer_confirmed'
+            ? 'Lab / probe test'
+            : draft.soilPh !== null
+              ? 'Farmer reported'
+              : 'Unavailable',
       },
       {
         key: 'drainage',
@@ -1022,8 +1033,6 @@ export function evaluateSingleCropSuitability(
         ? `${weakest.label} (${weakest.statusText}) is the primary limiting factor.`
         : 'No severe limiting factor under current field parameters.';
 
-    const confidencePct = Math.min(96, Math.max(38, Math.round(confidenceWeight)));
-
     const status: CropSuitabilityEvaluation['status'] = isExcluded
       ? 'excluded'
       : combined >= 78
@@ -1040,7 +1049,6 @@ export function evaluateSingleCropSuitability(
       botanicalFamily: spec.botanicalFamily,
       matchScore: isExcluded ? null : combined,
       status,
-      confidencePct,
       limitingFactor,
       plainSummary:
         isExcluded
@@ -1546,14 +1554,6 @@ export function runRotationPlannerEngine(
       calibratedScore = Math.min(97, calibratedScore + 6);
     }
 
-    const avgConfidence = Math.round(
-      Math.max(
-        38,
-        specs.reduce((acc, s) => acc + (suitByCropId.get(s.id)?.confidencePct ?? 72), 0) / specs.length -
-          (historyUnknown ? 7 : 0)
-      )
-    );
-
     const dataGaps = Array.from(
       new Set([
         ...(historyUnknown ? ['Confirmed prior-season crop history'] : []),
@@ -1631,11 +1631,10 @@ export function runRotationPlannerEngine(
       subtitle: bp.subtitle,
       matchScore: calibratedScore,
       uncertaintyMarginPts: dataGaps.length > 2 ? 6 : 4,
-      confidencePct: avgConfidence,
       confidenceReason:
         dataGaps.length === 0
-          ? 'High evidence coverage across soil texture, pH, water reliability, and crop parameters.'
-          : `Moderate-to-high confidence; adding ${dataGaps[0].toLowerCase()} narrows uncertainty.`,
+          ? 'Core soil texture, pH, water reliability, and crop parameters provided.'
+          : `Data gap note: adding ${dataGaps[0].toLowerCase()} narrows planning uncertainty.`,
       dataGaps,
       isRecommended: false,
       fitSummary:
@@ -1858,13 +1857,19 @@ export function compareRotationPlans(
       winner: 'tie',
     },
     {
-      criterion: 'Evidence Confidence',
-      leftValue: `${left.confidencePct}%`,
-      rightValue: `${right.confidencePct}%`,
+      criterion: 'Data Availability',
+      leftValue:
+        left.dataGaps.length === 0
+          ? 'Complete inputs'
+          : `${left.dataGaps.length} input gap${left.dataGaps.length === 1 ? '' : 's'}`,
+      rightValue:
+        right.dataGaps.length === 0
+          ? 'Complete inputs'
+          : `${right.dataGaps.length} input gap${right.dataGaps.length === 1 ? '' : 's'}`,
       winner:
-        left.confidencePct === right.confidencePct
+        left.dataGaps.length === right.dataGaps.length
           ? 'tie'
-          : left.confidencePct > right.confidencePct
+          : left.dataGaps.length < right.dataGaps.length
             ? 'left'
             : 'right',
     },
@@ -1995,7 +2000,6 @@ export function buildCandidateForSavePayload(
     id: candidate.id,
     title: candidate.title,
     suitabilityScore: candidate.matchScore,
-    confidencePct: candidate.confidencePct,
     primaryBenefit: candidate.fitSummary,
     waterDemandImpact:
       candidate.components.waterEfficiency >= 85
